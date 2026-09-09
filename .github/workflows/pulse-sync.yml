@@ -9,6 +9,11 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repo (needed for keep-alive commit)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -22,19 +27,16 @@ jobs:
         with:
           script: |
             const https = require('https');
-
             const FIREBASE_URL = 'insight-3bbec-default-rtdb.firebaseio.com';
             const FIREBASE_SEC = process.env.FIREBASE_SECRET;
             const GEMINI_KEY   = process.env.GEMINI_API_KEY;
             const GEMINI_MODEL = 'gemini-2.5-flash-lite';
             const MAX_POSTS    = 50;
-
             const SOURCES = [
               { name:'NEJM' }, { name:'The Lancet' }, { name:'JAMA' },
               { name:'BMJ' }, { name:'Nature Medicine' }, { name:'Science Daily' },
               { name:'Medscape' }, { name:'Stat News' }, { name:'Medical News Today' },
             ];
-
             function httpsRequest(options, body) {
               return new Promise((resolve, reject) => {
                 const req = https.request(options, (res) => {
@@ -47,7 +49,6 @@ jobs:
                 req.end();
               });
             }
-
             async function callGemini(prompt) {
               const systemText = 'You are writing for Research Junction by Sandra Bakare MD/MBA. ' +
                 'Voice: authoritative, accessible, direct. Audience: medical researchers. ' +
@@ -75,28 +76,32 @@ jobs:
               const data = JSON.parse(rb);
               if (status === 429) throw new Error('RATE_LIMITED');
               if (status !== 200) throw new Error('Gemini ' + status + ': ' + (data.error || {}).message);
-
-              // Extract text from all parts including thinking parts
+              // Extract grounding citation URL from metadata
+              let sourceUrl = null;
+              let sourceUrlVerified = false;
               const candidate = (data.candidates || [])[0] || {};
-              const parts = (candidate.content && candidate.content.parts) || [];
-              // Collect only non-thinking text parts
-              let text = parts
-                .filter(p => p.text && !p.thought)
-                .map(p => p.text)
-                .join('');
-
-              // If empty, try all parts
-              if (!text.trim()) {
-                text = parts.filter(p => p.text).map(p => p.text).join('');
+              const groundingMeta = candidate.groundingMetadata || {};
+              // Try groundingChunks first
+              const chunks = groundingMeta.groundingChunks || [];
+              for (const chunk of chunks) {
+                const url = chunk.web && chunk.web.uri;
+                if (url && url.startsWith('http')) { sourceUrl = url; sourceUrlVerified = true; break; }
               }
-
-              // Strip markdown fences
+              // Fallback: parse chip hrefs from renderedContent
+              if (!sourceUrlVerified) {
+                const rendered = (groundingMeta.searchEntryPoint || {}).renderedContent || '';
+                const chipMatch = rendered.match(/href="(https?:\/\/[^"]+)"/);
+                if (chipMatch) { sourceUrl = chipMatch[1]; sourceUrlVerified = true; }
+              }
+              // Extract text parts
+              const parts = (candidate.content && candidate.content.parts) || [];
+              let text = parts.filter(p => p.text && !p.thought).map(p => p.text).join('');
+              if (!text.trim()) text = parts.filter(p => p.text).map(p => p.text).join('');
               text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
-
               console.log('Raw response preview:', text.slice(0, 200));
-              return text;
+              console.log('sourceUrlVerified:', sourceUrlVerified, '| sourceUrl:', sourceUrl);
+              return { text, sourceUrl, sourceUrlVerified };
             }
-
             async function firebaseGet(path) {
               const { status, body } = await httpsRequest({
                 hostname: FIREBASE_URL,
@@ -106,7 +111,6 @@ jobs:
               if (status !== 200) throw new Error('Firebase GET ' + status);
               return JSON.parse(body);
             }
-
             async function firebasePut(path, data) {
               const body = JSON.stringify(data);
               const { status, body: resp } = await httpsRequest({
@@ -117,9 +121,7 @@ jobs:
               }, body);
               if (status !== 200) throw new Error('Firebase PUT ' + status + ': ' + resp);
             }
-
             function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
             async function generatePost(source, usedUrls) {
               const avoid = usedUrls.slice(-10).join(', ') || 'none yet';
               const prompt =
@@ -136,8 +138,7 @@ jobs:
                 '  "content": "## What The Research Found\\n[findings]\\n## Why This Matters\\n[implications]\\n## Research Junction Take\\n[commentary]",\n' +
                 '  "publishedAt": "' + new Date().toISOString() + '"\n' +
                 '}';
-
-              const raw = await callGemini(prompt);
+              const { text: raw, sourceUrl: verifiedUrl, sourceUrlVerified } = await callGemini(prompt);
               const start = raw.indexOf('{');
               const end = raw.lastIndexOf('}');
               if (start === -1 || end === -1) {
@@ -145,12 +146,19 @@ jobs:
                 throw new Error('No JSON in response');
               }
               const post = JSON.parse(raw.slice(start, end + 1));
-              if (!post.title || !post.sourceUrl) throw new Error('Post missing required fields');
+              if (!post.title) throw new Error('Post missing title');
+              // Use grounding-verified URL if available, otherwise fall back to model-reported URL
+              post.sourceUrl = verifiedUrl || post.sourceUrl || null;
+              post.sourceUrlVerified = sourceUrlVerified;
+              // Discard post entirely if no verified source link
+              if (!sourceUrlVerified) {
+                console.log('Discarding post — no verified source URL for ' + source.name);
+                return null;
+              }
               post.id = 'post_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
               post.publishedAt = post.publishedAt || new Date().toISOString();
               return post;
             }
-
             // Main
             console.log('Starting Pulse sync...');
             let existingPosts = {};
@@ -164,34 +172,40 @@ jobs:
               const ud = await firebaseGet('pulse/usedUrls');
               if (Array.isArray(ud)) usedUrls = ud;
             } catch(e) {}
-
             const shuffled = [...SOURCES].sort(() => Math.random() - 0.5).slice(0, 3);
             const newPosts = {};
-
             for (let i = 0; i < shuffled.length; i++) {
               if (i > 0) { console.log('Waiting 15s...'); await sleep(15000); }
               const source = shuffled[i];
               console.log('Generating for ' + source.name + '...');
               try {
                 const post = await generatePost(source, usedUrls);
-                newPosts[post.id] = post;
-                usedUrls.push(post.sourceUrl);
-                console.log('Done: ' + post.title);
+                if (post) {
+                  newPosts[post.id] = post;
+                  usedUrls.push(post.sourceUrl);
+                  console.log('Saved: ' + post.title);
+                }
               } catch(e) {
                 console.warn('Failed for ' + source.name + ':', e.message);
               }
             }
-
-            if (Object.keys(newPosts).length === 0) { console.log('No new posts this cycle'); return; }
-
+            if (Object.keys(newPosts).length === 0) { console.log('No verified posts this cycle'); return; }
             const allPosts = Object.assign({}, existingPosts, newPosts);
             const sorted = Object.values(allPosts)
               .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt))
               .slice(0, MAX_POSTS);
             const trimmed = {};
             sorted.forEach(p => { trimmed[p.id] = p; });
-
             await firebasePut('pulse/posts', trimmed);
             await firebasePut('pulse/usedUrls', usedUrls.slice(-500));
             await firebasePut('pulse/meta', { lastUpdate: Date.now() });
             console.log('Saved ' + Object.keys(newPosts).length + ' new posts. Total: ' + sorted.length);
+
+      - name: Keep-alive commit (resets GitHub 60-day inactivity timer)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "pulse-sync: $(date -u '+%Y-%m-%d %H:%M UTC')" > .pulse-keepalive
+          git add .pulse-keepalive
+          git diff --staged --quiet || git commit -m "chore: pulse keepalive $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
